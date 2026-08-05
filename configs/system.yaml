@@ -1,0 +1,26 @@
+system:
+  name: "AIC Video Retrieval System"
+  version: "1.0.0"
+  device: "cuda"
+  seed: 42
+  num_workers: 4
+
+paths:
+  raw_videos: "datasets/raw_videos"
+  keyframes: "datasets/keyframes"
+  shots: "datasets/shots"
+  indexes: "indexes"
+  models: "models"
+  outputs: "outputs"
+  logs: "logs"
+
+retrieval:
+  top_k: 100
+  rerank_top_k: 20
+  fusion_strategy: "rrf"  # options: rrf, weighted_sum
+
+models:
+  visual_embedder: "siglip"
+  text_embedder: "bge"
+  ocr_engine: "paddleocr"
+  asr_engine: "whisper"

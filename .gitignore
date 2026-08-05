@@ -1,0 +1,60 @@
+# Python & Pycache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Datasets & Checkpoints (Data Lake)
+datasets/raw_videos/*
+!datasets/raw_videos/.gitkeep
+datasets/keyframes/*
+!datasets/keyframes/.gitkeep
+datasets/shots/*
+!datasets/shots/.gitkeep
+datasets/scenes/*
+!datasets/scenes/.gitkeep
+datasets/metadata/*
+!datasets/metadata/.gitkeep
+datasets/subtitles/*
+!datasets/subtitles/.gitkeep
+datasets/ocr/*
+!datasets/ocr/.gitkeep
+datasets/objects/*
+!datasets/objects/.gitkeep
+datasets/captions/*
+!datasets/captions/.gitkeep
+datasets/embeddings/*
+!datasets/embeddings/.gitkeep
+datasets/queries/*
+!datasets/queries/.gitkeep
+datasets/groundtruth/*
+!datasets/groundtruth/.gitkeep
+
+# Vector Indexes
+indexes/*
+!indexes/**/.gitkeep
+
+# Model Checkpoints
+models/*
+!models/**/.gitkeep
+
+# Output Runs & Submission Files
+outputs/*
+!outputs/**/.gitkeep
+
+# Logs
+logs/*
+!logs/**/.gitkeep
+
+# IDEs & System
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Environment Variables
+.env

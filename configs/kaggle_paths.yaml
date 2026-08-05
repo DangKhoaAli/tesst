@@ -1,0 +1,60 @@
+# ============================================================
+# Kaggle Environment Path Configuration
+# Overrides system.yaml when running inside Kaggle Notebooks
+# ============================================================
+
+kaggle:
+  # Root input directory (read-only, mounted from Kaggle Datasets)
+  input_root: "/kaggle/input"
+
+  # Working directory (writable, temporary per session)
+  working_root: "/kaggle/working"
+
+  # Dataset slugs (user/dataset-slug format)
+  datasets:
+    aic_data: "aic-hcmc-data"          # Main video + keyframe dataset slug
+    aic_indexes: "aic-hcmc-indexes"    # Pre-built indexes (output dataset)
+
+# ============================================================
+# Derived Dataset Paths (under input_root/aic_data/)
+# ============================================================
+paths:
+  # Template: replace {L} with batch id (e.g., L21), {V} with video id (e.g., V001)
+  videos_dir: "/kaggle/input/{dataset_slug}/Videos_{L}_a/video"
+  video_file: "/kaggle/input/{dataset_slug}/Videos_{L}_a/video/{L}_{V}.mp4"
+
+  keyframes_root: "/kaggle/input/{dataset_slug}/keyframes/keyframes"
+  keyframes_dir: "/kaggle/input/{dataset_slug}/keyframes/keyframes/Keyframes_{L}/keyframes/{L}_{V}"
+  keyframe_file: "/kaggle/input/{dataset_slug}/keyframes/keyframes/Keyframes_{L}/keyframes/{L}_{V}/{n}.jpg"
+
+  clip_features_root: "/kaggle/input/{dataset_slug}/clip-features-32-aic25-b/clip-features-32"
+  clip_features_file: "/kaggle/input/{dataset_slug}/clip-features-32-aic25-b/clip-features-32/{L}_{V}.npy"
+
+  map_keyframes_root: "/kaggle/input/{dataset_slug}/map-keyframes-aic25-b1/map-keyframes"
+  map_keyframes_file: "/kaggle/input/{dataset_slug}/map-keyframes-aic25-b1/map-keyframes/{L}_{V}.csv"
+
+  media_info_root: "/kaggle/input/{dataset_slug}/media-info-aic25-b1/media-info"
+  media_info_file: "/kaggle/input/{dataset_slug}/media-info-aic25-b1/media-info/{L}_{V}.json"
+
+  # Extracted features (generated, saved to working dir then uploaded as dataset)
+  ocr_output: "/kaggle/working/ocr"
+  captions_output: "/kaggle/working/captions"
+  asr_output: "/kaggle/working/subtitles"
+  objects_output: "/kaggle/working/objects"
+
+# ============================================================
+# Index Paths (output → saved to aic_indexes dataset)
+# ============================================================
+indexes:
+  faiss_visual: "/kaggle/working/indexes/faiss_visual.index"
+  faiss_ids_map: "/kaggle/working/indexes/faiss_ids_map.json"    # int_id → "L21_V001_n5"
+  qdrant_snapshot: "/kaggle/working/indexes/qdrant_snapshot"
+  keyframe_master: "/kaggle/working/indexes/keyframe_master.parquet"
+
+# ============================================================
+# Local Fallback Paths (when running on d:\AIC_System locally)
+# ============================================================
+local:
+  data_root: "datasets"
+  indexes_root: "indexes"
+  outputs_root: "outputs"
