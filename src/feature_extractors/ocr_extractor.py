@@ -78,12 +78,25 @@ class OCRExtractor(BaseExtractor):
         if not _PADDLE_AVAILABLE:
             raise ImportError("paddleocr not installed. Run: pip install paddleocr")
         logger.info(f"Loading PaddleOCR (lang={self.lang}, gpu={self.use_gpu})")
-        self._ocr = _PaddleOCR(
-            use_angle_cls=self.use_angle_cls,
-            lang=self.lang,
-            use_gpu=self.use_gpu,
-            show_log=False,
-        )
+        
+        # Handle paddleocr version compatibility (2.x vs 3.x / Paddlex)
+        base_kwargs = {
+            "use_angle_cls": self.use_angle_cls,
+            "lang": self.lang,
+            "show_log": False,
+        }
+        try:
+            # PaddleOCR 2.x uses use_gpu=True/False
+            self._ocr = _PaddleOCR(use_gpu=self.use_gpu, **base_kwargs)
+        except (ValueError, TypeError):
+            try:
+                # PaddleOCR 3.x uses device="gpu" or "cpu"
+                device_str = "gpu" if self.use_gpu else "cpu"
+                self._ocr = _PaddleOCR(device=device_str, **base_kwargs)
+            except (ValueError, TypeError):
+                # Fallback to default device
+                self._ocr = _PaddleOCR(**base_kwargs)
+
         logger.info("PaddleOCR loaded.")
         return self
 
