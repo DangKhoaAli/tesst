@@ -79,25 +79,35 @@ class OCRExtractor(BaseExtractor):
             raise ImportError("paddleocr not installed. Run: pip install paddleocr")
         logger.info(f"Loading PaddleOCR (lang={self.lang}, gpu={self.use_gpu})")
         
-        # Handle paddleocr version compatibility (2.x vs 3.x / Paddlex)
-        base_kwargs = {
-            "use_angle_cls": self.use_angle_cls,
-            "lang": self.lang,
-            "show_log": False,
-        }
-        try:
-            # PaddleOCR 2.x uses use_gpu=True/False
-            self._ocr = _PaddleOCR(use_gpu=self.use_gpu, **base_kwargs)
-        except (ValueError, TypeError):
-            try:
-                # PaddleOCR 3.x uses device="gpu" or "cpu"
-                device_str = "gpu" if self.use_gpu else "cpu"
-                self._ocr = _PaddleOCR(device=device_str, **base_kwargs)
-            except (ValueError, TypeError):
-                # Fallback to default device
-                self._ocr = _PaddleOCR(**base_kwargs)
+        # Progressive fallback across PaddleOCR versions (2.x vs 3.x)
+        attempts = [
+            # 1. Full PaddleOCR 2.x standard
+            {"use_angle_cls": self.use_angle_cls, "lang": self.lang, "use_gpu": self.use_gpu, "show_log": False},
+            # 2. Without show_log
+            {"use_angle_cls": self.use_angle_cls, "lang": self.lang, "use_gpu": self.use_gpu},
+            # 3. Without use_gpu
+            {"use_angle_cls": self.use_angle_cls, "lang": self.lang, "show_log": False},
+            # 4. PaddleOCR 3.x minimal (lang + angle_cls)
+            {"use_angle_cls": self.use_angle_cls, "lang": self.lang},
+            # 5. PaddleOCR 3.x minimal (lang only)
+            {"lang": self.lang},
+            # 6. Bare default
+            {},
+        ]
 
-        logger.info("PaddleOCR loaded.")
+        self._ocr = None
+        last_error = None
+        for kwargs in attempts:
+            try:
+                self._ocr = _PaddleOCR(**kwargs)
+                logger.info(f"PaddleOCR loaded successfully (used args: {list(kwargs.keys())})")
+                break
+            except (ValueError, TypeError, Exception) as e:
+                last_error = e
+
+        if self._ocr is None:
+            raise RuntimeError(f"Failed to load PaddleOCR: {last_error}")
+
         return self
 
     def extract_one(
