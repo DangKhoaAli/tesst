@@ -256,16 +256,27 @@ class CaptionGenerator(BaseExtractor):
         keyframe_results = []
         for i, (_, row) in enumerate(df.iterrows()):
             n = int(row["n"])
-            img_path = str(
-                Path(keyframes_dir)
-                / f"Keyframes_{batch_id}"
-                / "keyframes"
-                / video_id
-                / f"{n}.jpg"
-            )
+            root = Path(keyframes_dir)
+            folders = [
+                root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                root / video_id,
+                root / f"Keyframes_{batch_id}" / video_id,
+            ]
+            names = [f"{n:03d}.jpg", f"{n}.jpg", f"{n:04d}.jpg", f"{n:02d}.jpg"]
 
-            if not Path(img_path).exists():
-                logger.warning(f"Image not found: {img_path}")
+            img_path = None
+            for folder in folders:
+                if folder.exists():
+                    for name in names:
+                        cand = folder / name
+                        if cand.exists():
+                            img_path = str(cand)
+                            break
+                if img_path:
+                    break
+
+            if not img_path or not Path(img_path).exists():
+                logger.warning(f"Image not found: {video_id} n={n}")
                 keyframe_results.append({
                     "n": n, "frame_idx": int(row["frame_idx"]),
                     "pts_time": float(row["pts_time"]),

@@ -96,13 +96,20 @@ class MetadataStore:
 
             for _, row in df_kf.iterrows():
                 n = int(row[CSV_COL_N])
-                image_path = str(
+                # Determine image filename (default 3-digit zero-padded: 001.jpg, 090.jpg)
+                base_dir = (
                     self.keyframes_image_root
                     / f"Keyframes_{batch_id}"
                     / "keyframes"
                     / video_id
-                    / KEYFRAME_NAME_FORMAT.format(n=n)
                 )
+                img_name = f"{n:03d}.jpg"
+                for cand_name in [f"{n:03d}.jpg", f"{n}.jpg", f"{n:04d}.jpg"]:
+                    if (base_dir / cand_name).exists():
+                        img_name = cand_name
+                        break
+
+                image_path = str(base_dir / img_name)
 
                 records.append({
                     "faiss_id":    faiss_id,

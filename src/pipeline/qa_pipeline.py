@@ -240,29 +240,26 @@ class QAPipeline:
         """
         try:
             batch_id = result.video_id.split("_")[0]   # e.g. "L21"
+            n = result.n
+            filename = f"{n:03d}.jpg"   # Luôn định dạng đúng 3 chữ số: 001.jpg, 090.jpg, 100.jpg
 
-            # Primary path (standard AIC dataset structure)
-            primary = (
-                self._kf_root
-                / f"Keyframes_{batch_id}"
-                / "keyframes"
-                / result.video_id
-                / f"{result.n}.jpg"
-            )
-            if primary.exists():
-                return primary
+            folders = [
+                self._kf_root / f"Keyframes_{batch_id}" / "keyframes" / result.video_id,
+                self._kf_root / result.video_id,
+                self._kf_root / f"Keyframes_{batch_id}" / result.video_id,
+            ]
 
-            # Fallback: flat structure
-            flat = self._kf_root / result.video_id / f"{result.n}.jpg"
-            if flat.exists():
-                return flat
+            for folder in folders:
+                p = folder / filename
+                if p.exists():
+                    return p
 
-            # Fallback: directly under kf_root
+            # Fallback nếu ở ngay dưới root
             direct = self._kf_root / f"{result.keyframe_id}.jpg"
             if direct.exists():
                 return direct
 
-            return primary  # Return primary anyway so caller sees the missing path
+            return folders[0] / filename
         except Exception as e:
             logger.debug(f"[QA] _get_image_path error for {result.keyframe_id}: {e}")
             return None

@@ -198,15 +198,31 @@ class OCRExtractor(BaseExtractor):
         keyframe_results = []
         for _, row in df.iterrows():
             n = int(row["n"])
-            img_path = str(
-                Path(keyframes_dir)
-                / f"Keyframes_{batch_id}"
-                / "keyframes"
-                / video_id
-                / f"{n}.jpg"
-            )
-            if not Path(img_path).exists():
-                logger.warning(f"Image not found: {img_path}")
+            # Định dạng ảnh luôn luôn là 3 chữ số (ví dụ: 001.jpg, 090.jpg, 100.jpg)
+            filename = f"{n:03d}.jpg"
+            root = Path(keyframes_dir)
+            folder_candidates = [
+                root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                root / video_id,
+                root / f"Keyframes_{batch_id}" / video_id,
+                root / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+            ]
+            
+            img_path = None
+            for folder in folder_candidates:
+                cand = folder / filename
+                if cand.exists():
+                    img_path = str(cand)
+                    break
+
+            if img_path is None and root.exists():
+                # Glob fallback nếu thư mục bị lồng khác biệt
+                found = list(root.glob(f"**/{video_id}/{filename}"))
+                if found:
+                    img_path = str(found[0])
+
+            if not img_path or not Path(img_path).exists():
+                logger.warning(f"Image not found for {video_id} n={n} ({filename})")
                 keyframe_results.append({
                     "n": n, "frame_idx": int(row["frame_idx"]),
                     "pts_time": float(row["pts_time"]),

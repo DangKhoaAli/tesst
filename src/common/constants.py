@@ -43,7 +43,7 @@ DEFAULT_FINAL_TOP_K    = 10    # Final results returned
 # Keyframe Image Format
 # ============================================================
 KEYFRAME_EXT        = ".jpg"
-KEYFRAME_NAME_FORMAT = "{n}.jpg"   # File name is just the n number
+KEYFRAME_NAME_FORMAT = "{n:03d}.jpg"   # Standard 3-digit zero-padded filename (e.g. 001.jpg, 090.jpg)
 
 # ============================================================
 # Parquet Master Index Schema
