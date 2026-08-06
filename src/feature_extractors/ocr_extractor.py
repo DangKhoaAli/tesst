@@ -169,6 +169,7 @@ class OCRExtractor(BaseExtractor):
         keyframes_dir: str,
         map_keyframes_csv: str,
         output_dir: str,
+        frame_step: int = 1,
         overwrite: bool = False,
     ) -> Path:
         """
@@ -196,7 +197,9 @@ class OCRExtractor(BaseExtractor):
         batch_id = video_id.split("_")[0]   # e.g. "L21"
 
         keyframe_results = []
-        for _, row in df.iterrows():
+        for idx, (_, row) in enumerate(df.iterrows()):
+            if frame_step > 1 and idx % frame_step != 0:
+                continue
             n = int(row["n"])
             # Định dạng ảnh luôn luôn là 3 chữ số (ví dụ: 001.jpg, 090.jpg, 100.jpg)
             filename = f"{n:03d}.jpg"
