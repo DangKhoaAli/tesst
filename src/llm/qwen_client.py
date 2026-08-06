@@ -1,17 +1,16 @@
 """
-Qwen2.5-VL Client — Shared VLM inference engine for Q&A and TRAKE alignment.
+Qwen2.5-VL Client — Shared VLM inference engine for Q&A and TRAKE alignment (v2).
 
-This client is a lightweight wrapper around the loaded Qwen2.5-VL model,
-used by both:
-  - QAPipeline     (answer extraction from keyframes)
-  - TRAKEPipeline  (event alignment verification)
-
-Separating the model loading from business logic allows the model to be
-loaded once and reused across both pipelines without duplication.
+Changes from v1:
+- answer_question(): Now passes answer_type to build_qa_combined_prompt for
+  type-specific instructions (count / color / name / yes_no / description).
+- answer_question(): Returns QAAnswer (not just str) — richer result with found/confidence.
+- score_alignment(): Passes activity_name for better TRAKE context.
+- _infer(): Unchanged core logic.
 
 Model VRAM requirements:
-  - Qwen2.5-VL-7B-Instruct (fp16):  ~14 GB VRAM (T4 on Kaggle fits)
-  - Qwen2.5-VL-7B-Instruct (4bit):  ~8  GB VRAM (safer for T4)
+  - Qwen2.5-VL-7B-Instruct (fp16):  ~14 GB VRAM
+  - Qwen2.5-VL-7B-Instruct (4bit):  ~8  GB VRAM (Kaggle T4 safe)
   - Qwen2.5-VL-3B-Instruct (fp16):  ~7  GB VRAM (faster, slightly lower quality)
 """
 
@@ -21,10 +20,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.llm.prompt_templates import (
+    build_qa_combined_prompt,
     build_qa_answer_prompt,
     build_qa_relevance_prompt,
     build_trake_align_prompt,
-    SYSTEM_QA, SYSTEM_VERIFY,
+    SYSTEM_QA, SYSTEM_VERIFY, SYSTEM_TRAKE,
 )
 from src.llm.response_parser import ResponseParser, QAAnswer, RelevanceScore, AlignmentScore
 from src.utils.logger import get_logger
@@ -42,24 +42,27 @@ except ImportError:
 
 class QwenVLClient:
     """
-    Qwen2.5-VL inference client for Visual Question Answering.
+    Qwen2.5-VL inference client for Visual Question Answering and TRAKE alignment.
 
-    Provides three high-level methods used by the Q&A and TRAKE pipelines:
-      - answer_question()    → QAAnswer
-      - score_relevance()    → RelevanceScore
-      - score_alignment()    → AlignmentScore  (for TRAKE)
+    Provides high-level methods used by the Q&A and TRAKE pipelines:
+      - answer_question()    → QAAnswer  (combined 1-call approach)
+      - score_relevance()    → RelevanceScore  (legacy 2-step, still available)
+      - score_alignment()    → AlignmentScore  (for TRAKE, chain-of-thought)
 
     Usage:
         client = QwenVLClient(load_in_4bit=True)
         client.load()
 
-        answer = client.answer_question(
+        result = client.answer_question(
             image_path="keyframes/L21/V001/5.jpg",
             event_description="Lễ trao giải âm nhạc...",
             question="Có bao nhiêu người lên sân khấu?",
+            answer_type="count",
         )
-        # answer.answer → "5"
-        # answer.confidence → 0.85
+        # result.answer      → "5"
+        # result.confidence  → 0.9
+        # result.found       → True
+        # result.observation → "Tôi thấy 5 người đứng trên sân khấu..."
     """
 
     def __init__(
@@ -67,7 +70,7 @@ class QwenVLClient:
         model_name: str = "Qwen/Qwen2.5-VL-7B-Instruct",
         device: str = "cuda",
         load_in_4bit: bool = False,
-        max_new_tokens: int = 200,
+        max_new_tokens: int = 256,
     ):
         self.model_name     = model_name
         self.device         = device
@@ -119,22 +122,29 @@ class QwenVLClient:
         image_path: str,
         event_description: str,
         question: str,
-        answer_language: str = "auto",
+        answer_language: str = "vi",
+        answer_type: str = "description",
     ) -> QAAnswer:
         """
         Answer a question about the event shown in the keyframe.
+        Uses combined 1-call approach (relevance + answer in one prompt).
 
         Args:
             image_path:        Path to keyframe .jpg
             event_description: Context about the event
             question:          The question to answer
             answer_language:   "vi" | "en" | "auto"
+            answer_type:       "count" | "color" | "name" | "yes_no" | "description"
 
         Returns:
-            QAAnswer with answer text and confidence
+            QAAnswer with answer text, confidence, found flag, and observation
         """
-        messages = build_qa_answer_prompt(
-            image_path, event_description, question, answer_language
+        messages = build_qa_combined_prompt(
+            image_path=image_path,
+            event_description=event_description,
+            question=question,
+            answer_type=answer_type,
+            answer_language=answer_language if answer_language != "auto" else "vi",
         )
         raw = self._infer(messages, system=SYSTEM_QA)
         return self._parser.parse_qa_answer(raw)
@@ -147,7 +157,8 @@ class QwenVLClient:
     ) -> RelevanceScore:
         """
         Score how relevant a keyframe is for answering the question.
-        Used to re-rank candidate frames in the Q&A pipeline.
+        NOTE: In the new pipeline this is rarely called — answer_question()
+        handles both relevance and answer in one call. Kept for backward compat.
 
         Returns:
             RelevanceScore with relevant bool and 0-1 confidence
@@ -161,16 +172,28 @@ class QwenVLClient:
         image_path: str,
         event_name: str,
         semantic_keyframe_hint: str,
+        activity_name: str = "",
     ) -> AlignmentScore:
         """
         Verify if a keyframe matches a specific TRAKE event moment.
-        Used in TRAKE Phase 2 per-event alignment (Sprint 5).
+        Uses chain-of-thought: describe → then judge.
+
+        Args:
+            image_path:             Path to keyframe .jpg
+            event_name:             e.g. "Giậm nhảy"
+            semantic_keyframe_hint: Detailed description of the target moment
+            activity_name:          e.g. "Nhảy cao" (optional context)
 
         Returns:
-            AlignmentScore with match bool and 0-1 confidence
+            AlignmentScore with match bool, confidence, observation, and reason
         """
-        messages = build_trake_align_prompt(image_path, event_name, semantic_keyframe_hint)
-        raw = self._infer(messages, system=SYSTEM_VERIFY)
+        messages = build_trake_align_prompt(
+            image_path=image_path,
+            event_name=event_name,
+            semantic_keyframe_hint=semantic_keyframe_hint,
+            activity_name=activity_name,
+        )
+        raw = self._infer(messages, system=SYSTEM_TRAKE)
         return self._parser.parse_alignment(raw)
 
     # ----------------------------------------------------------
@@ -214,6 +237,7 @@ class QwenVLClient:
                     **inputs,
                     max_new_tokens=self.max_new_tokens,
                     do_sample=False,
+                    temperature=None,  # greedy decoding for determinism
                 )
             generated = output_ids[:, inputs.input_ids.shape[1]:]
             result = self._processor.batch_decode(

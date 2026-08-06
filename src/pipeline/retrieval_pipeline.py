@@ -1,12 +1,10 @@
 """
-Retrieval Pipeline — end-to-end query processing for all 3 AIC task types.
-
-Sprint 4 update: QA pipeline fully wired with Qwen2.5-VL VQA.
+Retrieval Pipeline — end-to-end query processing for all 3 AIC task types (v2).
 
 Flow:
-  KIS  → visual + text retrieval → RRF fusion → best frame
-  Q&A  → visual + text retrieval → RRF fusion → VLM answer extraction
-  TRAKE → stub (Sprint 5)
+  KIS   → visual + text retrieval → RRF fusion → best frame
+  Q&A   → enriched retrieval (event_desc + question) → VLM 1-call per frame → voting
+  TRAKE → compact Phase1 query → per-event alignment with temporal window → VLM verify
 """
 
 from __future__ import annotations
@@ -282,12 +280,21 @@ class RetrievalPipeline:
                 rrf=self._rrf,
                 top_k_retrieval=self._top_k_ret,
                 top_k_fusion=self._top_k_fus,
+                max_frames=20,
+                min_confidence=0.30,
+                high_conf_threshold=0.80,
             )
 
-        # Parse QA query
-        event_desc = query_dict.get("description", "")
-        question   = query_dict.get("question", "")
-        qa_query   = self._parser.parse_qa(event_desc, question)
+        # Parse QA query — infer answer_type from question
+        event_desc  = query_dict.get("description", "")
+        question    = query_dict.get("question", "")
+        answer_lang = query_dict.get("answer_language", "auto")
+        qa_query    = self._parser.parse_qa(event_desc, question, answer_language=answer_lang)
+
+        logger.debug(
+            f"[QA] answer_type='{qa_query.answer_type}' | "
+            f"event='{event_desc[:60]}' | Q='{question[:60]}'"
+        )
 
         # Run QA pipeline
         qa_result: Optional[QASubmission] = self._qa_pipeline.run(qa_query, query_id=query_id)
@@ -328,7 +335,7 @@ class RetrievalPipeline:
                 rrf=self._rrf,
                 vlm_client=self._vlm,
                 enable_vlm_verify=(self._vlm is not None),
-                top_k_videos=5,
+                top_k_videos=10,           # Increased from 5 for better sport coverage
                 top_k_frames_per_event=self._top_k_fus,
             )
 

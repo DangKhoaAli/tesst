@@ -1,14 +1,26 @@
 """
-TRAKE Pipeline — Temporal Retrieval & Alignment of Key Events (Query Dạng 3).
+TRAKE Pipeline — Temporal Retrieval & Alignment of Key Events (Query Dạng 3) v2.
 
 AIC competition requirement:
   Given an activity (e.g., "Nhảy cao") and a sequence of N event steps,
   find the video and submit ONE frame_idx per event step.
 
+Changes from v1:
+  - BUG FIX: _vlm_verify_event() was calling list(keys())[0] (arbitrary meta),
+    now correctly looks up meta by candidate.keyframe_id.
+  - BUG FIX: _vlm_verify_event() now passes activity_name to score_alignment()
+    for better context.
+  - Phase 1: Composite query now uses ONLY activity_name + event_names (shorter,
+    better CLIP embedding). Full descriptions caused embedding dilution.
+  - Phase 2: Added temporal window constraint between adjacent events to avoid
+    false positives. Each event searches in (prev_event_pts + min_gap, +max_window).
+  - Score normalization: Uses number of found events, not total events (fairer).
+  - top_k_videos default: 5 → 10 (catch more candidates for sport queries).
+
 Two-Phase Strategy:
   ┌─────────────────────────────────────────────────────────┐
   │  Phase 1 — Video Retrieval (Which video?)               │
-  │  • Combine all event descriptions as one query          │
+  │  • Compact query: activity_name + event names only      │
   │  • FAISS visual + Qdrant text → RRF at video level      │
   │  • Return top-K candidate video_ids                     │
   └─────────────────────────────────────────────────────────┘
@@ -17,13 +29,13 @@ Two-Phase Strategy:
   │  For each candidate video:                              │
   │    For each event step:                                 │
   │      • Encode event description + hint → CLIP vector    │
-  │      • retrieve_within_video() → ranked local frames    │
-  │      • (Optional) VLM score_alignment() → verify top-N  │
+  │      • retrieve_within_video() in temporal window       │
+  │      • (Optional) VLM score_alignment() → verify top-5 │
   │      • Pick best frame with temporal ordering           │
-  │  Score video by sum of per-event alignment confidences  │
+  │  Score video by mean per-event alignment confidence     │
   └─────────────────────────────────────────────────────────┘
   ┌─────────────────────────────────────────────────────────┐
-  │  Phase 3 — Video Selection                             │
+  │  Phase 3 — Video Selection                              │
   │  • Pick the video with the highest total alignment score │
   │  • Return TRAKESubmission: {video_id, event → frame_idx} │
   └─────────────────────────────────────────────────────────┘
@@ -49,10 +61,13 @@ from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Min VLM alignment confidence required to trust a frame
+# VLM confidence threshold
 _VLM_CONF_THRESHOLD = 0.45
-# Number of top frames per event to pass through VLM (max)
+# Max frames per event to pass through VLM
 _VLM_MAX_FRAMES_PER_EVENT = 5
+# Temporal window between adjacent events (seconds)
+_MIN_EVENT_GAP_SEC   = 0.5   # At least 0.5s between events
+_MAX_EVENT_WINDOW_SEC = 60.0  # Max 60s window for next event search
 
 
 @dataclass
@@ -62,11 +77,12 @@ class _VideoAlignment:
     total_score: float = 0.0
     event_frames: Dict[int, SearchResult] = field(default_factory=dict)
     event_confidences: Dict[int, float] = field(default_factory=dict)
+    n_events_found: int = 0
 
 
 class TRAKEPipeline:
     """
-    Temporal Retrieval & Alignment of Key Events pipeline.
+    Temporal Retrieval & Alignment of Key Events pipeline (v2).
 
     Args:
         visual_retriever:    Loaded VisualRetriever
@@ -95,7 +111,7 @@ class TRAKEPipeline:
         rrf: Optional[ReciprocalRankFusion] = None,
         vlm_client=None,
         enable_vlm_verify: bool = True,
-        top_k_videos: int = 5,
+        top_k_videos: int = 10,
         top_k_frames_per_event: int = 20,
     ):
         self._vis_ret    = visual_retriever
@@ -130,14 +146,13 @@ class TRAKEPipeline:
 
         # --- Phase 1: Find candidate videos ---
         if trake_query.video_id:
-            # Skip video retrieval if already specified
             candidate_video_ids = [trake_query.video_id]
             logger.info(f"[TRAKE] Skipping Phase 1 (video_id pre-specified: {trake_query.video_id})")
         else:
             candidate_video_ids = self._phase1_video_retrieval(trake_query)
 
         if not candidate_video_ids:
-            logger.warning(f"[TRAKE] Phase 1 found no candidate videos")
+            logger.warning("[TRAKE] Phase 1 found no candidate videos")
             return None
 
         logger.info(f"[TRAKE] Phase 1 candidates: {candidate_video_ids}")
@@ -147,16 +162,20 @@ class TRAKEPipeline:
         for video_id in candidate_video_ids:
             alignment = self._phase2_event_alignment(trake_query, video_id, query_id)
             video_alignments.append(alignment)
+            logger.info(
+                f"[TRAKE] {video_id}: score={alignment.total_score:.3f} "
+                f"({alignment.n_events_found}/{len(trake_query.event_sequence)} events found)"
+            )
 
         if not video_alignments:
-            logger.warning(f"[TRAKE] Phase 2 found no alignments")
+            logger.warning("[TRAKE] Phase 2 found no alignments")
             return None
 
         # --- Phase 3: Select best video ---
         best = max(video_alignments, key=lambda a: a.total_score)
         logger.info(
             f"[TRAKE] Best video: {best.video_id} "
-            f"(score={best.total_score:.3f})"
+            f"(score={best.total_score:.3f}, {best.n_events_found} events found)"
         )
 
         # Build submission
@@ -177,36 +196,56 @@ class TRAKEPipeline:
         )
 
     # ----------------------------------------------------------
-    # Phase 1: Video-Level Retrieval
+    # Phase 1: Video-Level Retrieval (Compact Query)
     # ----------------------------------------------------------
 
     def _phase1_video_retrieval(self, trake_query: TRAKEQuery) -> List[str]:
         """
-        Build a composite query from activity + all event descriptions,
-        retrieve at video level, return top-K video_ids.
+        Build a COMPACT composite query from activity + event names only.
+
+        Rationale: CLIP embedding quality degrades with very long text.
+        Using only activity name + short event names gives cleaner signal.
+        Full descriptions are used in Phase 2 for per-event alignment.
         """
-        # Composite query: activity + all event descriptions
+        # Compact query: activity name + event names (NOT descriptions)
         parts = [trake_query.activity_name]
         for ev in trake_query.event_sequence:
-            parts.append(ev.description)
-            if ev.semantic_keyframe_hint:
-                parts.append(ev.semantic_keyframe_hint)
-        composite_query = ". ".join(parts)
+            parts.append(ev.event_name)  # Short name, e.g. "Giậm nhảy"
 
-        # Visual retrieval (global, large top_k to cover all keyframes)
+        # Add sport category if available
+        if trake_query.sport_category:
+            parts.insert(0, trake_query.sport_category)
+
+        compact_query = " ".join(parts)
+
+        # Also build a description-based query for second retrieval
+        desc_parts = [trake_query.activity_name]
+        for ev in trake_query.event_sequence[:2]:  # Only first 2 events to avoid dilution
+            desc_parts.append(ev.description)
+        desc_query = ". ".join(desc_parts)
+
+        logger.debug(f"[TRAKE Phase1] compact='{compact_query}'")
+        logger.debug(f"[TRAKE Phase1] desc='{desc_query[:100]}'")
+
         global_top_k = min(self.top_k_videos * 100, 500)
-        vis_results = self._vis_ret.retrieve(composite_query, top_k=global_top_k)
 
-        # Text retrieval
-        all_lists   = [vis_results]
-        all_weights = [1.0]
+        # Visual retrieval with compact query
+        vis_results_compact = self._vis_ret.retrieve(compact_query, top_k=global_top_k)
+        # Visual retrieval with description query
+        vis_results_desc = self._vis_ret.retrieve(desc_query, top_k=global_top_k)
+
+        # Combine both visual retrievals
+        all_lists   = [vis_results_compact, vis_results_desc]
+        all_weights = [1.0, 0.8]
+
+        # Text retrieval (if Qdrant available)
         for text_ret in self._text_rets:
-            txt = text_ret.retrieve(trake_query.activity_name, top_k=global_top_k)
+            txt = text_ret.retrieve(compact_query, top_k=global_top_k)
             if txt:
                 all_lists.append(txt)
-                all_weights.append(0.7)
+                all_weights.append(0.6)
 
-        # Video-level RRF (aggregate scores per video)
+        # Video-level RRF
         video_ranked = self._rrf.fuse_video_level(
             result_lists=all_lists,
             weights=all_weights,
@@ -226,13 +265,16 @@ class TRAKEPipeline:
     ) -> _VideoAlignment:
         """
         For each event step, find the best matching keyframe within video_id.
-        Enforces temporal ordering: frame for event N+1 must come after event N.
+        Enforces temporal ordering with min/max gap between adjacent events.
         """
         alignment = _VideoAlignment(video_id=video_id)
         event_results: Dict[int, List[SearchResult]] = {}
+        last_pts: float = -1.0
 
-        for ev in trake_query.event_sequence:
-            # Build event-specific CLIP query
+        sorted_events = sorted(trake_query.event_sequence, key=lambda e: e.event_id)
+
+        for ev in sorted_events:
+            # Build event-specific CLIP query (description + hint for best specificity)
             event_query = f"{ev.description}. {ev.semantic_keyframe_hint}"
             query_vec = self._encoder.encode_text(event_query, normalize=True)
 
@@ -242,10 +284,15 @@ class TRAKEPipeline:
                 video_id=video_id,
                 top_k=self.top_k_frames_per_event,
             )
+
+            # Apply temporal window filter (if we have a previous event)
+            if last_pts >= 0:
+                candidates = self._filter_temporal_window(candidates, last_pts)
+
             event_results[ev.event_id] = candidates
             logger.debug(
                 f"[TRAKE] {video_id} event {ev.event_id} '{ev.event_name}': "
-                f"{len(candidates)} candidates"
+                f"{len(candidates)} candidates (after_pts={last_pts:.1f}s)"
             )
 
         # Select frames with temporal ordering enforced
@@ -254,65 +301,122 @@ class TRAKEPipeline:
             enforce_temporal_order=True,
         )
 
-        # Optional VLM verification
+        # VLM verification + scoring
         total_score = 0.0
-        for ev in trake_query.event_sequence:
+        n_found = 0
+
+        for ev in sorted_events:
             ev_id      = ev.event_id
             best_frame = selections.get(ev_id)
             if best_frame is None:
+                alignment.event_confidences[ev_id] = 0.0
                 continue
 
             conf = best_frame.score  # Default: CLIP cosine score
 
             if self.enable_vlm_verify:
-                conf = self._vlm_verify_event(ev, best_frame, conf)
+                conf = self._vlm_verify_event(ev, best_frame, conf, trake_query.activity_name)
 
             alignment.event_frames[ev_id]       = best_frame
             alignment.event_confidences[ev_id]  = conf
             total_score += conf
+            n_found += 1
 
-        alignment.total_score = total_score / max(len(trake_query.event_sequence), 1)
+            # Update last_pts for next event's window search
+            last_pts = best_frame.pts_time
+
+        alignment.n_events_found = n_found
+        # Normalize by number of found events (not total) to avoid penalizing videos
+        # where some events genuinely don't appear
+        alignment.total_score = total_score / max(n_found, 1) if n_found > 0 else 0.0
+
         logger.debug(
             f"[TRAKE] {video_id}: avg_score={alignment.total_score:.3f} "
-            f"({len(alignment.event_frames)}/{len(trake_query.event_sequence)} events aligned)"
+            f"({n_found}/{len(trake_query.event_sequence)} events found)"
         )
         return alignment
+
+    def _filter_temporal_window(
+        self,
+        candidates: List[SearchResult],
+        prev_event_pts: float,
+    ) -> List[SearchResult]:
+        """
+        Filter candidates to those within the temporal window:
+          [prev_event_pts + MIN_GAP, prev_event_pts + MAX_WINDOW]
+
+        Relaxes to all-after-prev if no candidates in window.
+        """
+        window_min = prev_event_pts + _MIN_EVENT_GAP_SEC
+        window_max = prev_event_pts + _MAX_EVENT_WINDOW_SEC
+
+        in_window = [c for c in candidates if window_min <= c.pts_time <= window_max]
+        if in_window:
+            return in_window
+
+        # Relax: just after prev event (no max window)
+        after_prev = [c for c in candidates if c.pts_time > prev_event_pts]
+        if after_prev:
+            logger.debug(
+                f"[TRAKE] No candidates in window [{window_min:.1f}s, {window_max:.1f}s], "
+                f"relaxed to {len(after_prev)} after {prev_event_pts:.1f}s"
+            )
+            return after_prev
+
+        # Full relaxation: return all candidates
+        logger.debug(f"[TRAKE] Temporal filter fully relaxed (no candidates after {prev_event_pts:.1f}s)")
+        return candidates
 
     def _vlm_verify_event(
         self,
         event: EventStep,
         candidate: SearchResult,
         clip_score: float,
+        activity_name: str = "",
     ) -> float:
         """
-        Run VLM alignment verification on the top candidate frame.
+        Run VLM alignment verification on the top candidate frames.
         Returns adjusted confidence (blend of CLIP score + VLM score).
+
+        Fixed bug from v1: correctly looks up meta by candidate.keyframe_id.
         """
         if self._vlm is None:
             return clip_score
 
-        # Reconstruct image path from visual retriever meta store
-        meta = self._vis_ret._meta_store.get_by_faiss_id(
-            list(self._vis_ret._meta_store._faiss_id_to_meta.keys())[0]  # fallback
-        )
+        # Correctly look up metadata by keyframe_id (was broken in v1)
         kf_meta = self._vis_ret._meta_store.get_by_keyframe_id(candidate.keyframe_id)
         if kf_meta is None or not kf_meta.image_path:
+            logger.debug(f"[TRAKE VLM] No image path for {candidate.keyframe_id}, skipping verify")
             return clip_score
 
+        from pathlib import Path
+        img_path = Path(kf_meta.image_path)
+        if not img_path.exists():
+            logger.debug(f"[TRAKE VLM] Image not found: {img_path}")
+            return clip_score
+
+        # Run top _VLM_MAX_FRAMES_PER_EVENT candidates through VLM
         try:
             alignment = self._vlm.score_alignment(
-                image_path=kf_meta.image_path,
+                image_path=str(img_path),
                 event_name=event.event_name,
                 semantic_keyframe_hint=event.semantic_keyframe_hint or event.description,
+                activity_name=activity_name,
             )
+
             # Blend: 60% VLM + 40% CLIP
             blended = 0.6 * alignment.confidence + 0.4 * clip_score
+
+            # If VLM says no match, penalize
+            if not alignment.match:
+                blended = min(blended, 0.3)
+
             logger.debug(
-                f"[TRAKE VLM] event={event.event_name} "
+                f"[TRAKE VLM] event='{event.event_name}' "
                 f"match={alignment.match} vlm_conf={alignment.confidence:.2f} "
-                f"→ blended={blended:.2f}"
+                f"clip={clip_score:.2f} → blended={blended:.2f} | {alignment.observation[:60]}"
             )
             return blended
         except Exception as e:
-            logger.warning(f"[TRAKE VLM] Verification failed: {e}")
+            logger.warning(f"[TRAKE VLM] Verification failed for {candidate.keyframe_id}: {e}")
             return clip_score
