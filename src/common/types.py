@@ -94,7 +94,9 @@ class TRAKEQuery:
     activity_name: str
     event_sequence: List[EventStep]
     sport_category: str = ""
-    top_k_videos: int = 10
+    top_k_videos: int = 10    # Number of candidate videos to check in Phase 1
+    top_k_frames: int = 20    # Candidates per event in Phase 2
+    video_id: str = ""        # If set, skip Phase 1 and go directly to alignment
 
 
 # ============================================================
@@ -139,6 +141,7 @@ class EvidenceResult:
     confidence: float
     explanation: str = ""
     top_results: List[SearchResult] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ============================================================

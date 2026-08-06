@@ -2,33 +2,27 @@
 Query Runner CLI — batch-process AIC queries from a JSON file.
 
 Reads a query JSON file, runs the RetrievalPipeline for each query,
-and writes BTC-standard submission CSV files.
+and writes BTC-standard submission CSV files for all 3 task types.
 
 Usage (local):
     python scripts/run_queries.py \\
-        --queries datasets/queries/kis_queries.json \\
+        --queries datasets/queries/sample_queries.json \\
         --index-dir indexes \\
         --output-dir outputs/submission
 
 Usage (Kaggle Notebook):
     !python AIC_System/scripts/run_queries.py \\
-        --queries /kaggle/input/aic-queries/kis_queries.json \\
+        --queries /kaggle/input/aic-queries/queries.json \\
         --index-dir /kaggle/input/aic-indexes \\
+        --keyframe-root /kaggle/input/aic-data/keyframes \\
+        --enable-vlm \\
         --output-dir /kaggle/working/submission
 
-Input JSON format (array of query objects):
+Input JSON format (array of query objects — all 3 types supported):
     [
-        {
-            "query_id": "q001",
-            "type": "textual_kis",
-            "text": "Tìm video về diễn giả mặc áo đỏ phát biểu tại cuộc họp báo ngoài trời"
-        },
-        {
-            "query_id": "q002",
-            "type": "qa",
-            "description": "Trong video lễ trao giải âm nhạc...",
-            "question": "Có bao nhiêu người lên sân khấu nhận giải lớn nhất?"
-        }
+        {"query_id": "q001", "type": "textual_kis", "text": "..."},
+        {"query_id": "q002", "type": "qa", "description": "...", "question": "..."},
+        {"query_id": "q003", "type": "trake", "activity": "...", "events": [...]}
     ]
 """
 
@@ -50,18 +44,28 @@ logger = get_logger("run_queries")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run AIC queries and produce submission CSV")
-    parser.add_argument("--queries",    required=True,
+    parser = argparse.ArgumentParser(
+        description="Run AIC queries (KIS / Q&A / TRAKE) and produce submission CSVs"
+    )
+    parser.add_argument("--queries",       required=True,
                         help="Path to queries JSON file")
-    parser.add_argument("--index-dir",  default="indexes",
+    parser.add_argument("--index-dir",     default="indexes",
                         help="Dir containing faiss_visual.index + keyframe_master.parquet")
-    parser.add_argument("--output-dir", default="outputs/submission",
+    parser.add_argument("--output-dir",    default="outputs/submission",
                         help="Output directory for submission CSV files")
-    parser.add_argument("--top-k",      type=int, default=100,
+    parser.add_argument("--keyframe-root", default="",
+                        help="Root dir of keyframe images (required for Q&A and TRAKE VLM)")
+    parser.add_argument("--enable-vlm",    action="store_true",
+                        help="Load Qwen2.5-VL for Q&A answer extraction and TRAKE verification")
+    parser.add_argument("--vlm-model",     default="Qwen/Qwen2.5-VL-7B-Instruct",
+                        help="VLM model name (default: Qwen2.5-VL-7B-Instruct)")
+    parser.add_argument("--qdrant-url",    default="",
+                        help="Qdrant URL for text retrieval (e.g. http://localhost:6333)")
+    parser.add_argument("--top-k",         type=int, default=100,
                         help="Number of retrieval candidates (default: 100)")
-    parser.add_argument("--clip-model", default="ViT-B-32",
+    parser.add_argument("--clip-model",    default="ViT-B-32",
                         help="CLIP model name (default: ViT-B-32)")
-    parser.add_argument("--device",     default=None,
+    parser.add_argument("--device",        default=None,
                         help="Compute device: cuda / cpu (auto-detect if not set)")
     return parser.parse_args()
 
@@ -91,6 +95,11 @@ def main():
         index_dir=args.index_dir,
         clip_model=args.clip_model,
         device=args.device,
+        keyframe_image_root=args.keyframe_root,
+        enable_vlm=args.enable_vlm,
+        vlm_model=args.vlm_model,
+        vlm_load_in_4bit=True,
+        qdrant_url=args.qdrant_url or None,
         top_k_retrieval=args.top_k,
     )
     logger.info(f"Pipeline ready in {time.time() - t0:.1f}s")
@@ -120,17 +129,23 @@ def main():
             logger.warning(f"No result for query_id={qid}")
             continue
 
-        # Add to appropriate submission bucket
+        # ── Route to appropriate submission bucket ────────────
         if qtype == QueryType.TEXTUAL_KIS:
             formatter.add_kis(qid, evidence)
 
         elif qtype == QueryType.QA:
-            answer = query_dict.get("expected_answer", "")  # placeholder; Sprint 4 fills this
+            answer = evidence.metadata.get("answer", "")
             formatter.add_qa(qid, evidence, answer=answer)
 
         elif qtype == QueryType.TRAKE:
-            # TRAKE returns multi-event result; stub for now
-            formatter.add_trake(qid, evidence.video_id, {1: evidence.frame_idx})
+            trake_sub = evidence.metadata.get("trake_submission")
+            if trake_sub is not None:
+                # Full TRAKE: one frame_idx per event step
+                event_frame_idxs = {ev.event_id: ev.frame_idx for ev in trake_sub.events}
+                formatter.add_trake(qid, trake_sub.video_id, event_frame_idxs)
+            else:
+                # Fallback: single frame mapped to event 1
+                formatter.add_trake(qid, evidence.video_id, {1: evidence.frame_idx})
 
         elapsed = time.time() - t_q
         logger.info(
@@ -140,12 +155,9 @@ def main():
         )
 
     # --------------------------------------------------------
-    # Save submission files
+    # Save all submission files at once
     # --------------------------------------------------------
-    formatter.save_kis()
-    formatter.save_qa()
-    formatter.save_trake()
-    formatter.save_json()
+    paths = formatter.save_all()   # auto-detects TRAKE event count
 
     stats = formatter.stats()
     total_time = time.time() - t_total
@@ -153,9 +165,9 @@ def main():
 
     logger.info("=" * 60)
     logger.info(f"Done in {total_time:.1f}s  (avg {avg_time:.2f}s/query)")
-    logger.info(f"KIS:   {stats['kis']} results")
-    logger.info(f"Q&A:   {stats['qa']} results")
-    logger.info(f"TRAKE: {stats['trake']} results")
+    logger.info(f"KIS:   {stats['kis']} results  → {paths['kis'].name}")
+    logger.info(f"Q&A:   {stats['qa']} results  → {paths['qa'].name}")
+    logger.info(f"TRAKE: {stats['trake']} results  → {paths['trake'].name}")
     logger.info(f"Errors: {errors}")
     logger.info(f"Output: {Path(args.output_dir).resolve()}")
     logger.info("=" * 60)

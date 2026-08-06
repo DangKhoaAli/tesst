@@ -1,13 +1,8 @@
 """
 Text Retriever — Qdrant-based search over captions, OCR, and ASR text.
 
-This retriever is used when text features (captions, OCR, subtitles) have
-been extracted and indexed into Qdrant. At Sprint 2, this is a functional
-stub that gracefully returns an empty list if Qdrant is not available,
-allowing the KIS pipeline to run on visual retrieval alone.
-
-Sprint 3 will fully populate this retriever when OCR/Caption extraction
-notebooks (kaggle_02 and kaggle_03) have been run.
+Sprint 3+ version: fully wired to QdrantDB and BGEEncoder.
+Gracefully returns empty list if Qdrant is not reachable or collection is empty.
 """
 
 from __future__ import annotations
@@ -20,61 +15,47 @@ from src.common.constants import (
     QDRANT_COLLECTION_CAPTIONS,
     QDRANT_COLLECTION_OCR,
     QDRANT_COLLECTION_ASR,
-    QDRANT_VECTOR_DIM_BGE,
 )
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Try to import qdrant_client — optional at this sprint
-try:
-    from qdrant_client import QdrantClient
-    from qdrant_client.models import ScoredPoint
-    _QDRANT_AVAILABLE = True
-except ImportError:
-    _QDRANT_AVAILABLE = False
-    logger.warning("qdrant_client not installed — TextRetriever will return empty results.")
-
 
 class TextRetriever(BaseRetriever):
     """
-    Retrieves keyframes via dense/sparse text search over Qdrant collections.
+    Retrieves keyframes via dense text search over Qdrant collections.
 
     Supports 3 text modalities:
       - "caption"  — auto-generated image captions (Qwen2.5-VL)
       - "ocr"      — extracted on-screen text (PaddleOCR)
-      - "asr"      — speech transcripts (Whisper)
-
-    Each modality maps to a separate Qdrant collection, queried via
-    BGE-M3 dense vectors and/or BM25 sparse vectors.
+      - "asr"      — speech transcripts (Faster-Whisper)
 
     Args:
-        qdrant_url:   Qdrant server URL (default: localhost:6333)
-        modality:     Which collection to search: "caption" | "ocr" | "asr"
-        bge_encoder:  Optional BGE-M3 encoder; if None, retriever is a stub
+        qdrant_db:  Connected QdrantDB instance (or None → stub mode)
+        bge_encoder: Loaded BGEEncoder (or None → stub mode)
+        modality:   Which collection to search: "caption" | "ocr" | "asr"
     """
+
+    _COLLECTION_MAP = {
+        "caption": QDRANT_COLLECTION_CAPTIONS,
+        "ocr":     QDRANT_COLLECTION_OCR,
+        "asr":     QDRANT_COLLECTION_ASR,
+    }
 
     def __init__(
         self,
-        qdrant_url: str = "http://localhost:6333",
         modality: str = "caption",
-        bge_encoder=None,
+        qdrant_db=None,      # QdrantDB instance
+        bge_encoder=None,    # BGEEncoder instance
     ):
-        self.qdrant_url = qdrant_url
-        self.modality = modality
+        if modality not in self._COLLECTION_MAP:
+            raise ValueError(
+                f"Unknown modality '{modality}'. "
+                f"Choose from: {list(self._COLLECTION_MAP)}"
+            )
+        self.modality    = modality
+        self._qdrant_db  = qdrant_db
         self._bge_encoder = bge_encoder
-        self._client: Optional[QdrantClient] = None
-
-        # Map modality → Qdrant collection name
-        self._collection_map = {
-            "caption": QDRANT_COLLECTION_CAPTIONS,
-            "ocr":     QDRANT_COLLECTION_OCR,
-            "asr":     QDRANT_COLLECTION_ASR,
-        }
-
-        if modality not in self._collection_map:
-            raise ValueError(f"Unknown modality '{modality}'. "
-                             f"Choose from: {list(self._collection_map)}")
 
     @property
     def name(self) -> str:
@@ -82,26 +63,12 @@ class TextRetriever(BaseRetriever):
 
     @property
     def collection(self) -> str:
-        return self._collection_map[self.modality]
+        return self._COLLECTION_MAP[self.modality]
 
-    # ----------------------------------------------------------
-    # Connect
-    # ----------------------------------------------------------
-
-    def connect(self) -> "TextRetriever":
-        """Establish Qdrant connection. Call before retrieve()."""
-        if not _QDRANT_AVAILABLE:
-            logger.warning("Qdrant not available — TextRetriever disabled.")
-            return self
-        try:
-            self._client = QdrantClient(url=self.qdrant_url, timeout=10)
-            # Quick health check
-            self._client.get_collections()
-            logger.info(f"Qdrant connected: {self.qdrant_url} | collection={self.collection}")
-        except Exception as e:
-            logger.warning(f"Qdrant connection failed ({e}) — TextRetriever disabled.")
-            self._client = None
-        return self
+    @property
+    def is_configured(self) -> bool:
+        """Returns True if both Qdrant and BGE encoder are set and ready."""
+        return self._qdrant_db is not None and self._bge_encoder is not None
 
     # ----------------------------------------------------------
     # Retrieve
@@ -115,32 +82,25 @@ class TextRetriever(BaseRetriever):
         """
         Search Qdrant for keyframes whose text (caption/ocr/asr) matches query.
 
-        Returns empty list if Qdrant is not connected (graceful fallback).
+        Returns empty list if Qdrant is not configured (graceful fallback).
         """
-        if self._client is None or self._bge_encoder is None:
-            logger.debug(f"[{self.name}] Skipped (not configured)")
-            return []
-
-        # Check collection exists
-        try:
-            collections = [c.name for c in self._client.get_collections().collections]
-            if self.collection not in collections:
-                logger.debug(f"[{self.name}] Collection '{self.collection}' not found — skipped")
-                return []
-        except Exception as e:
-            logger.warning(f"[{self.name}] Qdrant health check failed: {e}")
+        if not self.is_configured:
+            logger.debug(f"[{self.name}] Skipped — not configured (Qdrant/BGE not set)")
             return []
 
         # Encode query with BGE-M3
-        query_vec = self._bge_encoder.encode(query, normalize=True)
-
-        # Dense vector search
         try:
-            hits = self._client.search(
-                collection_name=self.collection,
-                query_vector=query_vec.tolist(),
-                limit=top_k,
-                with_payload=True,
+            query_vec = self._bge_encoder.encode(query, normalize=True)
+        except Exception as e:
+            logger.warning(f"[{self.name}] BGE encoding failed: {e}")
+            return []
+
+        # Search Qdrant
+        try:
+            hits = self._qdrant_db.search(
+                query_vec=query_vec,
+                collection=self.modality,
+                top_k=top_k,
             )
         except Exception as e:
             logger.warning(f"[{self.name}] Qdrant search failed: {e}")
@@ -148,16 +108,15 @@ class TextRetriever(BaseRetriever):
 
         results: List[SearchResult] = []
         for hit in hits:
-            payload = hit.payload or {}
             results.append(SearchResult(
-                keyframe_id=payload.get("keyframe_id", ""),
-                video_id=payload.get("video_id", ""),
-                n=int(payload.get("n", 0)),
-                frame_idx=int(payload.get("frame_idx", 0)),
-                pts_time=float(payload.get("pts_time", 0.0)),
-                score=float(hit.score),
+                keyframe_id=hit.get("keyframe_id", ""),
+                video_id=hit.get("video_id", ""),
+                n=int(hit.get("n", 0)),
+                frame_idx=int(hit.get("frame_idx", 0)),
+                pts_time=float(hit.get("pts_time", 0.0)),
+                score=float(hit.get("score", 0.0)),
                 retriever_source=self.name,
-                metadata={"text_snippet": payload.get("text", "")[:100]},
+                metadata={"text_snippet": hit.get("text", "")[:100]},
             ))
 
         logger.debug(f"[{self.name}] '{query[:50]}' → {len(results)} results")

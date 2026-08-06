@@ -5,8 +5,11 @@ Converts raw natural-language queries into structured objects
 (TextualKISQuery, QAQuery, TRAKEQuery) using a lightweight
 rule-based extractor backed by an optional LLM for refinement.
 
-At Sprint 2, parsing is rule-based (regex + keyword lists).
-LLM-enhanced parsing will be added in Sprint 4 for TRAKE.
+Optimization v2:
+- build_retrieval_text() appends spatial, color, object, and OCR hints
+  to the CLIP encoding prompt for maximum KIS / Q&A recall.
+- Vi→En keyword mapping boosts CLIP cross-lingual alignment (CLIP was
+  trained predominantly on English captions).
 """
 
 from __future__ import annotations
@@ -175,22 +178,77 @@ class QueryParser:
             top_k=top_k,
         )
 
-    def build_retrieval_text(self, kis_query: TextualKISQuery) -> str:
+    # ============================================================
+    # Vietnamese → English keyword maps for CLIP cross-lingual boost
+    # (CLIP was trained on English captions; EN terms ↑ recall)
+    # ============================================================
+    _VI_TO_EN_COLORS = {
+        "đỏ": "red", "xanh": "blue", "vàng": "yellow", "trắng": "white",
+        "đen": "black", "tím": "purple", "hồng": "pink", "cam": "orange",
+        "nâu": "brown", "xám": "gray",
+    }
+    _VI_TO_EN_SCENES = {
+        "ngoài trời": "outdoor", "trong nhà": "indoor", "sân khấu": "stage",
+        "sân vận động": "stadium", "phòng họp": "conference room",
+        "đường phố": "street", "họp báo": "press conference",
+        "lễ trao giải": "award ceremony",
+    }
+    _VI_TO_EN_SPATIAL = {
+        "phía sau": "behind", "phía trước": "in front",
+        "bên trái": "on the left", "bên phải": "on the right",
+        "phía trên": "above", "phía dưới": "below",
+        "bên cạnh": "next to",
+    }
+
+    def build_retrieval_text(self, kis_query: "TextualKISQuery") -> str:
         """
         Build the final retrieval text string to encode with CLIP.
 
-        Strategy: use the full raw_text as-is for CLIP (CLIP handles
-        Vietnamese reasonably; multilingual is a bonus). Optionally
-        prefix with structured keywords to boost signal.
+        Strategy (v2 — optimized):
+          1. Start with full raw_text (Vietnamese context preserved).
+          2. Append English translations of colors, scenes, and objects.
+             → Boosts CLIP recall because CLIP is English-dominant.
+          3. Append spatial relationship hints for precise localization.
+          4. Append quoted OCR keywords (text visible on screen).
         """
         parts = [kis_query.raw_text]
 
-        # Boost colour/object signal in the query
-        if kis_query.parsed_colors:
-            parts.append(", ".join(kis_query.parsed_colors))
+        # 1. Translate & append colors (VI + EN for dual signal)
+        color_en_terms = []
+        for vi_color in kis_query.parsed_colors:
+            en = self._VI_TO_EN_COLORS.get(vi_color, vi_color)
+            color_en_terms.append(en)
+        if color_en_terms:
+            parts.append("wearing " + " and ".join(color_en_terms))
+
+        # 2. Translate & append scene context
+        if kis_query.parsed_scene:
+            scene_text = kis_query.parsed_scene
+            # Try to translate each Vietnamese phrase in the scene
+            for vi, en in self._VI_TO_EN_SCENES.items():
+                if vi in kis_query.raw_text.lower():
+                    scene_text = en
+                    break
+            parts.append(scene_text)
+
+        # 3. Append object labels (CLIP responds well to English nouns)
         if kis_query.parsed_objects:
             parts.append(", ".join(kis_query.parsed_objects))
-        if kis_query.parsed_scene:
-            parts.append(kis_query.parsed_scene)
+
+        # 4. Append spatial hints translated to English
+        spatial_en = []
+        for hint in kis_query.spatial_hints:
+            translated = hint
+            for vi, en in self._VI_TO_EN_SPATIAL.items():
+                if vi in hint:
+                    translated = en
+                    break
+            spatial_en.append(translated)
+        if spatial_en:
+            parts.append(", ".join(spatial_en))
+
+        # 5. Append OCR keywords (for frames with on-screen text)
+        if kis_query.ocr_keywords:
+            parts.append("text on screen: " + " ".join(kis_query.ocr_keywords))
 
         return ". ".join(parts)

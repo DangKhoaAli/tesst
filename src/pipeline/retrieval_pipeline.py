@@ -1,20 +1,12 @@
 """
 Retrieval Pipeline — end-to-end query processing for all 3 AIC task types.
 
-Orchestrates the full retrieval flow for Sprint 2 (KIS focus):
-  Query text
-    → QueryClassifier  (which type?)
-    → QueryParser      (structured fields)
-    → VisualRetriever  (FAISS CLIP-32 search)
-    → TextRetriever    (Qdrant caption/ocr — graceful stub)
-    → RRF Fusion
-    → FrameSelector    (pick best frame)
-    → EvidenceResult   (video_id, frame_idx, pts_time)
+Sprint 4 update: QA pipeline fully wired with Qwen2.5-VL VQA.
 
-Sprint 3/4 will extend this with:
-  - CLIPReranker (cross-modal reranking)
-  - QA pipeline (VLM answer extraction)
-  - TRAKE pipeline (2-phase temporal alignment)
+Flow:
+  KIS  → visual + text retrieval → RRF fusion → best frame
+  Q&A  → visual + text retrieval → RRF fusion → VLM answer extraction
+  TRAKE → stub (Sprint 5)
 """
 
 from __future__ import annotations
@@ -23,9 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.common.enums import QueryType
-from src.common.types import (
-    EvidenceResult, SearchResult, TextualKISQuery,
-)
+from src.common.types import EvidenceResult, QASubmission, TRAKESubmission, TRAKEEventResult
 from src.reasoning.query_classifier import QueryClassifier
 from src.reasoning.query_parser import QueryParser
 from src.retrieval.visual_retriever import VisualRetriever
@@ -44,13 +34,21 @@ class RetrievalPipeline:
     """
     End-to-end retrieval pipeline routing queries to the appropriate sub-pipeline.
 
-    Usage:
+    KIS  → _run_kis()     (Sprint 2)
+    Q&A  → _run_qa()      (Sprint 4, requires vlm_client + keyframe_image_root)
+    TRAKE → _run_trake()  (Sprint 5 stub)
+
+    Usage (minimal — KIS only):
+        pipeline = RetrievalPipeline.from_index_dir(index_dir="indexes")
+        result = pipeline.run({"type": "textual_kis", "text": "..."})
+
+    Usage (full — KIS + Q&A):
         pipeline = RetrievalPipeline.from_index_dir(
             index_dir="indexes",
-            clip_model="ViT-B-32",
+            keyframe_image_root="datasets/keyframes/keyframes",
+            enable_vlm=True,
+            vlm_load_in_4bit=True,
         )
-        result = pipeline.run({"text": "người dẫn mặc áo đỏ..."})
-        # → EvidenceResult(video_id="L21_V001", frame_idx=1500, ...)
     """
 
     def __init__(
@@ -59,6 +57,8 @@ class RetrievalPipeline:
         meta_store: MetadataStore,
         encoder: CLIPEncoder,
         text_retrievers: Optional[List[TextRetriever]] = None,
+        vlm_client=None,                # QwenVLClient (optional)
+        keyframe_image_root: str = "",  # Required for QA / TRAKE
         rrf_k: int = 60,
         visual_weight: float = 1.0,
         text_weight: float = 0.8,
@@ -68,8 +68,9 @@ class RetrievalPipeline:
         self._faiss_db   = faiss_db
         self._meta_store = meta_store
         self._encoder    = encoder
+        self._vlm        = vlm_client
+        self._kf_root    = keyframe_image_root
 
-        # Core modules
         self._classifier  = QueryClassifier()
         self._parser      = QueryParser()
         self._vis_ret     = VisualRetriever(faiss_db, meta_store, encoder)
@@ -77,11 +78,14 @@ class RetrievalPipeline:
         self._rrf         = ReciprocalRankFusion(k=rrf_k)
         self._selector    = FrameSelector()
 
-        # Weights: visual vs each text retriever
         self._visual_weight = visual_weight
         self._text_weight   = text_weight
         self._top_k_ret     = top_k_retrieval
         self._top_k_fus     = top_k_fusion
+
+        # Lazy-init sub-pipelines (init once on first use)
+        self._qa_pipeline    = None
+        self._trake_pipeline = None
 
     # ----------------------------------------------------------
     # Factory
@@ -94,42 +98,92 @@ class RetrievalPipeline:
         clip_model: str = "ViT-B-32",
         clip_pretrained: str = "openai",
         device: Optional[str] = None,
+        keyframe_image_root: str = "",
+        enable_vlm: bool = False,
+        vlm_model: str = "Qwen/Qwen2.5-VL-7B-Instruct",
+        vlm_load_in_4bit: bool = True,
+        qdrant_url: Optional[str] = None,
         **kwargs,
     ) -> "RetrievalPipeline":
         """
         Load all components from a pre-built index directory.
 
-        Expected layout:
-            index_dir/
-            ├── faiss_visual.index
-            ├── keyframe_master.parquet
-            └── faiss_ids_map.json   (optional, for validation)
+        Args:
+            index_dir:             Dir with faiss_visual.index + keyframe_master.parquet
+            keyframe_image_root:   Root of keyframe images (for QA/TRAKE VLM inference)
+            enable_vlm:            Load Qwen2.5-VL for Q&A support
+            vlm_load_in_4bit:      Use 4-bit quantization for VLM
+            qdrant_url:            If set, connect Qdrant and add text retrievers
         """
         idx = Path(index_dir)
 
-        # Load FAISS index
+        # FAISS
         faiss_db = FaissDB()
         faiss_db.load(str(idx / "faiss_visual.index"))
 
-        # Load metadata store
+        # Metadata
         meta_store = MetadataStore(
-            map_keyframes_root="",   # Not needed when loading parquet
+            map_keyframes_root="",
             keyframes_image_root="",
         ).load(str(idx / "keyframe_master.parquet"))
 
-        # Load CLIP encoder
+        # CLIP encoder
         encoder = CLIPEncoder(
             model_name=clip_model,
             pretrained=clip_pretrained,
             device=device,
         ).load()
 
+        # Optional: Qdrant text retrievers
+        text_retrievers = []
+        if qdrant_url:
+            try:
+                from src.database.qdrant_db import QdrantDB
+                from src.embeddings.text.bge import BGEEncoder
+
+                bge = BGEEncoder()
+                bge.load()
+                qdrant_db = QdrantDB(url=qdrant_url)
+                qdrant_db.connect()
+
+                for modality in ["caption", "ocr", "asr"]:
+                    text_retrievers.append(TextRetriever(
+                        modality=modality,
+                        qdrant_db=qdrant_db,
+                        bge_encoder=bge,
+                    ))
+                logger.info(f"Qdrant text retrievers ready (3 modalities)")
+            except Exception as e:
+                logger.warning(f"Qdrant setup failed: {e} — visual-only mode")
+
+        # Optional: VLM client
+        vlm_client = None
+        if enable_vlm:
+            try:
+                from src.llm.qwen_client import QwenVLClient
+                vlm_client = QwenVLClient(
+                    model_name=vlm_model,
+                    device=device or "cuda",
+                    load_in_4bit=vlm_load_in_4bit,
+                )
+                vlm_client.load()
+                logger.info("Qwen2.5-VL client ready")
+            except Exception as e:
+                logger.warning(f"VLM loading failed: {e} — QA will use retrieval-only")
+
         logger.info(
             f"RetrievalPipeline ready — "
-            f"index: {faiss_db.total_vectors:,} vectors, "
-            f"metadata: {meta_store.total_keyframes:,} keyframes"
+            f"FAISS: {faiss_db.total_vectors:,} vectors | "
+            f"text_rets: {len(text_retrievers)} | "
+            f"VLM: {'yes' if vlm_client else 'no'}"
         )
-        return cls(faiss_db, meta_store, encoder, **kwargs)
+        return cls(
+            faiss_db, meta_store, encoder,
+            text_retrievers=text_retrievers,
+            vlm_client=vlm_client,
+            keyframe_image_root=keyframe_image_root,
+            **kwargs,
+        )
 
     # ----------------------------------------------------------
     # Main Entry Point
@@ -140,41 +194,30 @@ class RetrievalPipeline:
         query_dict: Dict[str, Any],
         query_id: str = "",
     ) -> Optional[EvidenceResult]:
-        """
-        Process one query dict and return the best evidence result.
-
-        Args:
-            query_dict: Parsed from JSON input file. Examples:
-                KIS:   {"type": "textual_kis", "text": "..."}
-                Q&A:   {"description": "...", "question": "..."}
-                TRAKE: {"activity": "...", "events": [...]}
-            query_id:   Optional ID string for logging
-
-        Returns:
-            EvidenceResult or None if no results found
-        """
+        """Process one query dict → EvidenceResult (KIS / QA / TRAKE)."""
         qtype = self._classifier.classify(query_dict)
         logger.info(f"[Pipeline] query_id='{query_id}' type={qtype.value}")
 
         if qtype == QueryType.TEXTUAL_KIS:
             return self._run_kis(query_dict, query_id)
+
         elif qtype == QueryType.QA:
-            return self._run_kis(query_dict, query_id)  # Phase 1 same as KIS; QA answer in Sprint 4
+            return self._run_qa(query_dict, query_id)
+
         elif qtype == QueryType.TRAKE:
-            logger.warning("TRAKE pipeline not yet implemented — running as KIS.")
-            return self._run_kis(query_dict, query_id)
+            return self._run_trake(query_dict, query_id)
+
         return None
 
     def run_batch(
         self,
         query_dicts: List[Dict[str, Any]],
     ) -> List[Optional[EvidenceResult]]:
-        """Process a list of queries and return results in order."""
+        """Process a list of queries in order."""
         results = []
         for i, qdict in enumerate(query_dicts):
             qid = qdict.get("query_id", str(i))
-            result = self.run(qdict, query_id=qid)
-            results.append(result)
+            results.append(self.run(qdict, query_id=qid))
         return results
 
     # ----------------------------------------------------------
@@ -186,39 +229,146 @@ class RetrievalPipeline:
         query_dict: Dict[str, Any],
         query_id: str,
     ) -> Optional[EvidenceResult]:
-        """
-        Full KIS retrieval flow:
-        Text → CLIP encode → FAISS search → (+ text search) → RRF → best frame
-        """
-        # 1. Parse query
+        """Text → CLIP → FAISS → (Qdrant) → RRF → best frame."""
         raw_text = query_dict.get("text") or query_dict.get("description", "")
         kis_query = self._parser.parse_kis(raw_text, top_k=self._top_k_ret)
         retrieval_text = self._parser.build_retrieval_text(kis_query)
 
-        # 2. Visual retrieval (FAISS)
-        vis_results = self._vis_ret.retrieve(retrieval_text, top_k=self._top_k_ret)
-
-        # 3. Text retrieval (Qdrant — may return empty if not configured)
-        all_result_lists = [vis_results]
-        all_weights      = [self._visual_weight]
+        vis_results  = self._vis_ret.retrieve(retrieval_text, top_k=self._top_k_ret)
+        all_lists    = [vis_results]
+        all_weights  = [self._visual_weight]
 
         for text_ret in self._text_rets:
-            txt_results = text_ret.retrieve(raw_text, top_k=self._top_k_ret)
-            if txt_results:
-                all_result_lists.append(txt_results)
+            txt = text_ret.retrieve(raw_text, top_k=self._top_k_ret)
+            if txt:
+                all_lists.append(txt)
                 all_weights.append(self._text_weight)
 
-        # 4. RRF fusion
-        fused = self._rrf.fuse(
-            result_lists=all_result_lists,
-            weights=all_weights,
-            top_k=self._top_k_fus,
-        )
-
+        fused = self._rrf.fuse(all_lists, all_weights, top_k=self._top_k_fus)
         if not fused:
-            logger.warning(f"[Pipeline] No results for query_id='{query_id}'")
+            logger.warning(f"[KIS] No results for query_id='{query_id}'")
             return None
 
-        # 5. Select best frame
-        evidence = self._selector.select_best(fused, query_id=query_id)
-        return evidence
+        return self._selector.select_best(fused, query_id=query_id)
+
+    # ----------------------------------------------------------
+    # Q&A Sub-Pipeline
+    # ----------------------------------------------------------
+
+    def _run_qa(
+        self,
+        query_dict: Dict[str, Any],
+        query_id: str,
+    ) -> Optional[EvidenceResult]:
+        """
+        Q&A: retrieve candidates, then run Qwen2.5-VL to extract answer.
+        Falls back to KIS (retrieval-only) if VLM is not available.
+        """
+        if self._vlm is None:
+            logger.warning(
+                "[QA] VLM not loaded — falling back to retrieval-only (no answer). "
+                "Pass enable_vlm=True to from_index_dir() for full QA support."
+            )
+            return self._run_kis(query_dict, query_id)
+
+        # Lazy-init QA pipeline
+        if self._qa_pipeline is None:
+            from src.pipeline.qa_pipeline import QAPipeline
+            self._qa_pipeline = QAPipeline(
+                visual_retriever=self._vis_ret,
+                vlm_client=self._vlm,
+                keyframe_image_root=self._kf_root,
+                text_retrievers=self._text_rets,
+                rrf=self._rrf,
+                top_k_retrieval=self._top_k_ret,
+                top_k_fusion=self._top_k_fus,
+            )
+
+        # Parse QA query
+        event_desc = query_dict.get("description", "")
+        question   = query_dict.get("question", "")
+        qa_query   = self._parser.parse_qa(event_desc, question)
+
+        # Run QA pipeline
+        qa_result: Optional[QASubmission] = self._qa_pipeline.run(qa_query, query_id=query_id)
+        if qa_result is None:
+            return None
+
+        # Wrap in EvidenceResult so the run_queries.py runner can handle uniformly
+        return EvidenceResult(
+            video_id=qa_result.video_id,
+            frame_idx=qa_result.frame_idx,
+            n=0,
+            pts_time=0.0,
+            confidence=1.0,
+            explanation=f"QA answer: {qa_result.answer}",
+            metadata={"answer": qa_result.answer, "query_type": "qa"},
+        )
+
+    # ----------------------------------------------------------
+    # TRAKE Sub-Pipeline
+    # ----------------------------------------------------------
+
+    def _run_trake(
+        self,
+        query_dict: Dict[str, Any],
+        query_id: str,
+    ) -> Optional[EvidenceResult]:
+        """
+        TRAKE: 3-phase pipeline (video retrieval → per-event alignment → best video).
+        Falls back to KIS if required components are missing.
+        """
+        # Lazy-init TRAKE pipeline
+        if self._trake_pipeline is None:
+            from src.pipeline.trake_pipeline import TRAKEPipeline
+            self._trake_pipeline = TRAKEPipeline(
+                visual_retriever=self._vis_ret,
+                clip_encoder=self._encoder,
+                text_retrievers=self._text_rets,
+                rrf=self._rrf,
+                vlm_client=self._vlm,
+                enable_vlm_verify=(self._vlm is not None),
+                top_k_videos=5,
+                top_k_frames_per_event=self._top_k_fus,
+            )
+
+        # Parse TRAKE query from dict
+        from src.common.types import TRAKEQuery, EventStep
+        events_raw = query_dict.get("events", query_dict.get("event_sequence", []))
+        event_seq = [
+            EventStep(
+                event_id=e.get("id", i + 1),
+                event_name=e.get("name", f"Event {i+1}"),
+                description=e.get("description", ""),
+                semantic_keyframe_hint=e.get("hint", e.get("semantic_keyframe_hint", "")),
+            )
+            for i, e in enumerate(events_raw)
+        ]
+        trake_query = TRAKEQuery(
+            activity_name=query_dict.get("activity", query_dict.get("activity_name", "")),
+            event_sequence=event_seq,
+            sport_category=query_dict.get("sport_category", ""),
+            top_k_videos=query_dict.get("top_k_videos", 5),
+            video_id=query_dict.get("video_id", ""),
+        )
+
+        trake_result: Optional[TRAKESubmission] = self._trake_pipeline.run(
+            trake_query, query_id=query_id
+        )
+        if trake_result is None:
+            return None
+
+        # Return first event's frame as the EvidenceResult (for uniform handling)
+        first_event = trake_result.events[0] if trake_result.events else None
+        return EvidenceResult(
+            video_id=trake_result.video_id,
+            frame_idx=first_event.frame_idx if first_event else 0,
+            n=0,
+            pts_time=first_event.pts_time if first_event else 0.0,
+            confidence=1.0,
+            explanation=f"TRAKE: {len(trake_result.events)} events aligned",
+            metadata={
+                "query_type": "trake",
+                "trake_submission": trake_result,
+            },
+        )

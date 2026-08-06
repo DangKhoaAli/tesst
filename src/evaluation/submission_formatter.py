@@ -112,14 +112,23 @@ class SubmissionFormatter:
     def save_trake(
         self,
         filename: str = "submission_trake.csv",
-        n_events: int = 4,
+        n_events: Optional[int] = None,
     ) -> Path:
         """
         Write TRAKE results to CSV.
 
         Args:
-            n_events: Number of events per query (determines column count)
+            n_events: Number of event columns. If None, auto-detected from
+                      the actual data (supports any number of events).
         """
+        if n_events is None:
+            # Auto-detect from data: find max event_id across all rows
+            max_ev = 4  # BTC minimum
+            for row in self._trake_rows:
+                ev_cols = [k for k in row if k.startswith("event_") and k.endswith("_frame_idx")]
+                max_ev = max(max_ev, len(ev_cols))
+            n_events = max_ev
+
         fieldnames = ["query_id", "video_id"] + [
             f"event_{i}_frame_idx" for i in range(1, n_events + 1)
         ]
@@ -156,6 +165,29 @@ class SubmissionFormatter:
         total = len(self._kis_rows) + len(self._qa_rows) + len(self._trake_rows)
         logger.info(f"Saved {total} total results → {out_path}")
         return out_path
+
+    def save_all(self) -> Dict[str, Path]:
+        """
+        Convenience method: save all 3 submission CSVs + JSON in one call.
+
+        Automatically detects the maximum number of events across TRAKE rows
+        so the CSV columns are always correct regardless of event count.
+
+        Returns:
+            Dict with keys 'kis', 'qa', 'trake', 'json' mapping to Path.
+        """
+        paths = {
+            "kis":   self.save_kis(),
+            "qa":    self.save_qa(),
+            "trake": self.save_trake(),    # n_events auto-detected
+            "json":  self.save_json(),
+        }
+        logger.info(
+            f"[SubmissionFormatter] Saved all: "
+            f"KIS={len(self._kis_rows)}, QA={len(self._qa_rows)}, "
+            f"TRAKE={len(self._trake_rows)}"
+        )
+        return paths
 
     # ----------------------------------------------------------
     # Stats
