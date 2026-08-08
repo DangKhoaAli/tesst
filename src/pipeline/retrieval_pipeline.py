@@ -132,8 +132,21 @@ class RetrievalPipeline:
             device=device,
         ).load()
 
-        # Optional: Qdrant text retrievers
+        # Optional: Text retrievers (Qdrant or In-Memory OCR)
         text_retrievers = []
+
+        ocr_dir = kwargs.pop("ocr_dir", None)
+        if ocr_dir and Path(ocr_dir).exists():
+            try:
+                from src.retrieval.ocr_retriever import InMemoryOCRRetriever
+                ocr_ret = InMemoryOCRRetriever(ocr_dir=ocr_dir, meta_store=meta_store)
+                ocr_ret.load()
+                if ocr_ret.is_configured:
+                    text_retrievers.append(ocr_ret)
+                    logger.info(f"InMemoryOCRRetriever loaded from: {ocr_dir}")
+            except Exception as e:
+                logger.warning(f"Failed to load InMemoryOCRRetriever: {e}")
+
         if qdrant_url:
             try:
                 from src.database.qdrant_db import QdrantDB
@@ -227,7 +240,7 @@ class RetrievalPipeline:
         query_dict: Dict[str, Any],
         query_id: str,
     ) -> Optional[EvidenceResult]:
-        """Text → CLIP → FAISS → (Qdrant) → RRF → best frame."""
+        """Text → CLIP → FAISS → (Qdrant / InMemory OCR) → RRF → best frame."""
         raw_text = query_dict.get("text") or query_dict.get("description", "")
         kis_query = self._parser.parse_kis(raw_text, top_k=self._top_k_ret)
         retrieval_text = self._parser.build_retrieval_text(kis_query)
@@ -237,7 +250,8 @@ class RetrievalPipeline:
         all_weights  = [self._visual_weight]
 
         for text_ret in self._text_rets:
-            txt = text_ret.retrieve(raw_text, top_k=self._top_k_ret)
+            q_input = kis_query if getattr(text_ret, "name", "") == "ocr_inmemory" else raw_text
+            txt = text_ret.retrieve(q_input, top_k=self._top_k_ret)
             if txt:
                 all_lists.append(txt)
                 all_weights.append(self._text_weight)
@@ -260,14 +274,34 @@ class RetrievalPipeline:
     ) -> Optional[EvidenceResult]:
         """
         Q&A: retrieve candidates, then run Qwen2.5-VL to extract answer.
-        Falls back to KIS (retrieval-only) if VLM is not available.
+        Generates a heuristic fallback answer if VLM is not available.
         """
+        event_desc  = query_dict.get("description", "")
+        question    = query_dict.get("question", "")
+        answer_lang = query_dict.get("answer_language", "auto")
+        qa_query    = self._parser.parse_qa(event_desc, question, answer_language=answer_lang)
+
         if self._vlm is None:
             logger.warning(
-                "[QA] VLM not loaded — falling back to retrieval-only (no answer). "
-                "Pass enable_vlm=True to from_index_dir() for full QA support."
+                "[QA] VLM not loaded — using visual retrieval with heuristic fallback answer."
             )
-            return self._run_kis(query_dict, query_id)
+            evidence = self._run_kis({"text": f"{event_desc} {question}"}, query_id)
+            if evidence:
+                # Fill metadata["answer"] using fallback heuristic
+                from src.pipeline.qa_pipeline import QAPipeline
+                tmp_qa = QAPipeline(self._vis_ret, None, "", self._text_rets, self._rrf)
+                cand = SearchResult(
+                    keyframe_id=f"{evidence.video_id}_n{evidence.n}",
+                    video_id=evidence.video_id,
+                    n=evidence.n,
+                    frame_idx=evidence.frame_idx,
+                    pts_time=evidence.pts_time,
+                    score=evidence.confidence,
+                    retriever_source="fallback",
+                    metadata=evidence.metadata,
+                )
+                evidence.metadata["answer"] = tmp_qa._generate_fallback_answer(cand, qa_query)
+            return evidence
 
         # Lazy-init QA pipeline
         if self._qa_pipeline is None:

@@ -61,6 +61,8 @@ def parse_args():
                         help="VLM model name (default: Qwen2.5-VL-7B-Instruct)")
     parser.add_argument("--qdrant-url",    default="",
                         help="Qdrant URL for text retrieval (e.g. http://localhost:6333)")
+    parser.add_argument("--ocr-dir",       default="",
+                        help="Dir containing extracted per-video OCR JSON files (e.g. datasets/ocr)")
     parser.add_argument("--top-k",         type=int, default=100,
                         help="Number of retrieval candidates (default: 100)")
     parser.add_argument("--clip-model",    default="ViT-B-32",
@@ -100,6 +102,7 @@ def main():
         vlm_model=args.vlm_model,
         vlm_load_in_4bit=True,
         qdrant_url=args.qdrant_url or None,
+        ocr_dir=args.ocr_dir or None,
         top_k_retrieval=args.top_k,
     )
     logger.info(f"Pipeline ready in {time.time() - t0:.1f}s")

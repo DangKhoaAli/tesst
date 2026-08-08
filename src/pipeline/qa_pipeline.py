@@ -183,9 +183,9 @@ class QAPipeline:
 
         # Step 4: Fallback to top retrieval result if VLM found nothing
         if best_frame is None or best_qa is None:
-            logger.warning(f"[QA] VLM found no answer — using top retrieval result with no answer")
             best_frame  = candidates[0]
-            answer_text = ""
+            answer_text = self._generate_fallback_answer(best_frame, qa_query)
+            logger.warning(f"[QA] VLM found no answer — using fallback answer: '{answer_text}'")
         else:
             answer_text = best_qa.answer
 
@@ -230,39 +230,82 @@ class QAPipeline:
 
     def _get_image_path(self, result: SearchResult) -> Optional[Path]:
         """
-        Reconstruct keyframe image path from SearchResult.
+        Reconstruct keyframe image path from SearchResult with robust path resolution.
 
-        Expected structure:
-            {kf_root}/Keyframes_{batch_id}/keyframes/{video_id}/{n}.jpg
-
-        Also tries flat structure:
-            {kf_root}/{video_id}/{n}.jpg
+        Checks:
+          1. Direct image_path in result.metadata
+          2. MetadataStore lookup via keyframe_id
+          3. Multiple filename patterns (001.jpg, 1.jpg, 0001.jpg, 01.jpg)
+          4. Multiple subfolder locations under keyframe_image_root
         """
         try:
-            batch_id = result.video_id.split("_")[0]   # e.g. "L21"
-            n = result.n
-            filename = f"{n:03d}.jpg"   # Luôn định dạng đúng 3 chữ số: 001.jpg, 090.jpg, 100.jpg
-
-            folders = [
-                self._kf_root / f"Keyframes_{batch_id}" / "keyframes" / result.video_id,
-                self._kf_root / result.video_id,
-                self._kf_root / f"Keyframes_{batch_id}" / result.video_id,
-            ]
-
-            for folder in folders:
-                p = folder / filename
+            # 1. Metadata in SearchResult
+            if result.metadata and result.metadata.get("image_path"):
+                p = Path(result.metadata["image_path"])
                 if p.exists():
                     return p
 
-            # Fallback nếu ở ngay dưới root
-            direct = self._kf_root / f"{result.keyframe_id}.jpg"
-            if direct.exists():
-                return direct
+            # 2. MetadataStore lookup
+            if hasattr(self._vis_ret, "_meta_store") and self._vis_ret._meta_store:
+                meta = self._vis_ret._meta_store.get_by_keyframe_id(result.keyframe_id)
+                if meta and meta.image_path:
+                    p = Path(meta.image_path)
+                    if p.exists():
+                        return p
 
-            return folders[0] / filename
+            # 3. Flexible filename & subfolder resolution
+            batch_id = result.video_id.split("_")[0]   # e.g. "L21"
+            n = result.n
+            filenames = [f"{n:03d}.jpg", f"{n}.jpg", f"{n:04d}.jpg", f"{n:02d}.jpg"]
+
+            folders = [
+                self._kf_root / f"Keyframes_{batch_id}" / "keyframes" / result.video_id,
+                self._kf_root / f"Keyframes_{batch_id}" / result.video_id,
+                self._kf_root / batch_id / "keyframes" / result.video_id,
+                self._kf_root / batch_id / result.video_id,
+                self._kf_root / "keyframes" / result.video_id,
+                self._kf_root / result.video_id,
+            ]
+
+            for folder in folders:
+                for fname in filenames:
+                    p = folder / fname
+                    if p.exists():
+                        return p
+
+            # Fallback direct under root
+            for fname in [f"{result.keyframe_id}.jpg", f"{result.video_id}_{n}.jpg"]:
+                p = self._kf_root / fname
+                if p.exists():
+                    return p
+
+            return folders[0] / filenames[0]
         except Exception as e:
             logger.debug(f"[QA] _get_image_path error for {result.keyframe_id}: {e}")
             return None
+
+    def _generate_fallback_answer(self, candidate: SearchResult, qa_query: QAQuery) -> str:
+        """Generate a heuristic fallback answer when VLM is unavailable or returns nothing."""
+        ocr_text = candidate.metadata.get("ocr_text", "") or candidate.metadata.get("text_snippet", "")
+        q_type = qa_query.answer_type
+
+        if q_type == "count":
+            # Extract digits from OCR if present, else default "1"
+            digits = re.findall(r"\b\d+\b", ocr_text)
+            return digits[0] if digits else "1"
+        elif q_type == "color":
+            # Extract color keywords
+            for vi_col in ["đỏ", "xanh", "vàng", "trắng", "đen", "tím", "hồng", "cam"]:
+                if vi_col in qa_query.question.lower() or vi_col in ocr_text.lower():
+                    return vi_col
+            return "không xác định"
+        elif q_type == "yes_no":
+            return "có"
+        elif q_type == "name":
+            return ocr_text[:30] if ocr_text else "không xác định"
+        else:
+            return ocr_text[:50] if ocr_text else qa_query.event_description[:50]
+
 
     def _vote_best_answer(
         self,
