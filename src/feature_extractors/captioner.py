@@ -253,27 +253,69 @@ class CaptionGenerator(BaseExtractor):
         df = pd.read_csv(map_keyframes_csv)
         batch_id = video_id.split("_")[0]
 
+        # Robust multi-level keyframe folder resolution (AVOID recursive glob)
+        root = Path(keyframes_dir)
+        video_dir = None
+
+        search_roots = []
+        curr = root
+        for _ in range(4):
+            if curr.exists() and curr not in search_roots:
+                search_roots.append(curr)
+            if curr.parent == curr:
+                break
+            curr = curr.parent
+
+        # 1. Fast subfolder matching for split batches (e.g., Keyframes_L26_a, Keyframes_L26_b, etc.)
+        for r in search_roots:
+            try:
+                for sub in r.iterdir():
+                    if sub.is_dir():
+                        if sub.name.startswith(f"Keyframes_{batch_id}") or sub.name.startswith(batch_id) or sub.name == "keyframes":
+                            for rel in [video_id, f"keyframes/{video_id}"]:
+                                cand = sub / rel
+                                if cand.exists() and cand.is_dir():
+                                    video_dir = cand
+                                    break
+                        if video_dir:
+                            break
+            except Exception:
+                pass
+            if video_dir:
+                break
+
+        # 2. Direct candidate paths fallback
+        if video_dir is None:
+            for r in search_roots:
+                candidates = [
+                    r / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                    r / f"Keyframes_{batch_id}" / video_id,
+                    r / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                    r / "keyframes" / f"Keyframes_{batch_id}" / video_id,
+                    r / "keyframes" / video_id,
+                    r / video_id,
+                    r / batch_id / "keyframes" / video_id,
+                    r / batch_id / video_id,
+                ]
+                for cand in candidates:
+                    if cand.exists() and cand.is_dir():
+                        video_dir = cand
+                        break
+                if video_dir:
+                    break
+
         keyframe_results = []
         for i, (_, row) in enumerate(df.iterrows()):
             n = int(row["n"])
-            root = Path(keyframes_dir)
-            folders = [
-                root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-                root / video_id,
-                root / f"Keyframes_{batch_id}" / video_id,
-            ]
             names = [f"{n:03d}.jpg", f"{n}.jpg", f"{n:04d}.jpg", f"{n:02d}.jpg"]
 
             img_path = None
-            for folder in folders:
-                if folder.exists():
-                    for name in names:
-                        cand = folder / name
-                        if cand.exists():
-                            img_path = str(cand)
-                            break
-                if img_path:
-                    break
+            if video_dir:
+                for name in names:
+                    cand = video_dir / name
+                    if cand.exists():
+                        img_path = str(cand)
+                        break
 
             if not img_path or not Path(img_path).exists():
                 logger.warning(f"Image not found: {video_id} n={n}")

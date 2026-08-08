@@ -196,29 +196,59 @@ class OCRExtractor(BaseExtractor):
         df = pd.read_csv(map_keyframes_csv)
         batch_id = video_id.split("_")[0]   # e.g. "L21"
 
-        # Find video keyframe folder once per video using static candidates (AVOID root.glob which hangs Kaggle filesystem)
+        # Robust multi-level keyframe folder resolution (AVOID recursive glob)
         root = Path(keyframes_dir)
         video_dir = None
-        folder_candidates = [
-            root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-            root / f"Keyframes_{batch_id}" / video_id,
-            root / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-            root / "keyframes" / f"Keyframes_{batch_id}" / video_id,
-            root / "keyframes" / video_id,
-            root / video_id,
-            root.parent / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-            root.parent / f"Keyframes_{batch_id}" / video_id,
-            root.parent / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-            root.parent / "keyframes" / video_id,
-            root.parent / video_id,
-        ]
-        for folder in folder_candidates:
-            if folder.exists():
-                video_dir = folder
+
+        search_roots = []
+        curr = root
+        for _ in range(4):
+            if curr.exists() and curr not in search_roots:
+                search_roots.append(curr)
+            if curr.parent == curr:
+                break
+            curr = curr.parent
+
+        # 1. Fast subfolder matching for split batches (e.g., Keyframes_L26_a, Keyframes_L26_b, etc.)
+        for r in search_roots:
+            try:
+                for sub in r.iterdir():
+                    if sub.is_dir():
+                        if sub.name.startswith(f"Keyframes_{batch_id}") or sub.name.startswith(batch_id) or sub.name == "keyframes":
+                            for rel in [video_id, f"keyframes/{video_id}"]:
+                                cand = sub / rel
+                                if cand.exists() and cand.is_dir():
+                                    video_dir = cand
+                                    break
+                        if video_dir:
+                            break
+            except Exception:
+                pass
+            if video_dir:
                 break
 
+        # 2. Direct candidate paths fallback
         if video_dir is None:
-            logger.warning(f"[OCR] Keyframe directory NOT FOUND for video {video_id} in {keyframes_dir}")
+            for r in search_roots:
+                candidates = [
+                    r / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                    r / f"Keyframes_{batch_id}" / video_id,
+                    r / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+                    r / "keyframes" / f"Keyframes_{batch_id}" / video_id,
+                    r / "keyframes" / video_id,
+                    r / video_id,
+                    r / batch_id / "keyframes" / video_id,
+                    r / batch_id / video_id,
+                ]
+                for cand in candidates:
+                    if cand.exists() and cand.is_dir():
+                        video_dir = cand
+                        break
+                if video_dir:
+                    break
+
+        if video_dir is None:
+            logger.warning(f"[OCR] Keyframe directory NOT FOUND for video {video_id} (searched from {root})")
 
         keyframe_results = []
         for idx, (_, row) in enumerate(df.iterrows()):
