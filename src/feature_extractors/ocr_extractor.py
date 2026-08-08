@@ -196,36 +196,46 @@ class OCRExtractor(BaseExtractor):
         df = pd.read_csv(map_keyframes_csv)
         batch_id = video_id.split("_")[0]   # e.g. "L21"
 
+        # Find video keyframe folder once per video using static candidates (AVOID root.glob which hangs Kaggle filesystem)
+        root = Path(keyframes_dir)
+        video_dir = None
+        folder_candidates = [
+            root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+            root / f"Keyframes_{batch_id}" / video_id,
+            root / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+            root / "keyframes" / f"Keyframes_{batch_id}" / video_id,
+            root / "keyframes" / video_id,
+            root / video_id,
+            root.parent / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+            root.parent / f"Keyframes_{batch_id}" / video_id,
+            root.parent / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
+            root.parent / "keyframes" / video_id,
+            root.parent / video_id,
+        ]
+        for folder in folder_candidates:
+            if folder.exists():
+                video_dir = folder
+                break
+
+        if video_dir is None:
+            logger.warning(f"[OCR] Keyframe directory NOT FOUND for video {video_id} in {keyframes_dir}")
+
         keyframe_results = []
         for idx, (_, row) in enumerate(df.iterrows()):
             if frame_step > 1 and idx % frame_step != 0:
                 continue
             n = int(row["n"])
-            # Định dạng ảnh luôn luôn là 3 chữ số (ví dụ: 001.jpg, 090.jpg, 100.jpg)
-            filename = f"{n:03d}.jpg"
-            root = Path(keyframes_dir)
-            folder_candidates = [
-                root / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-                root / video_id,
-                root / f"Keyframes_{batch_id}" / video_id,
-                root / "keyframes" / f"Keyframes_{batch_id}" / "keyframes" / video_id,
-            ]
-            
-            img_path = None
-            for folder in folder_candidates:
-                cand = folder / filename
-                if cand.exists():
-                    img_path = str(cand)
-                    break
 
-            if img_path is None and root.exists():
-                # Glob fallback nếu thư mục bị lồng khác biệt
-                found = list(root.glob(f"**/{video_id}/{filename}"))
-                if found:
-                    img_path = str(found[0])
+            img_path = None
+            if video_dir:
+                for fname in [f"{n:03d}.jpg", f"{n}.jpg", f"{n:04d}.jpg", f"{n:02d}.jpg"]:
+                    cand = video_dir / fname
+                    if cand.exists():
+                        img_path = str(cand)
+                        break
 
             if not img_path or not Path(img_path).exists():
-                logger.warning(f"Image not found for {video_id} n={n} ({filename})")
+                logger.warning(f"Image not found for {video_id} n={n}")
                 keyframe_results.append({
                     "n": n, "frame_idx": int(row["frame_idx"]),
                     "pts_time": float(row["pts_time"]),
